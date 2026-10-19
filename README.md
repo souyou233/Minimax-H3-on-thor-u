@@ -5,8 +5,8 @@
 
 **Self-contained ComfyUI appliance + field guide** · **自包含 ComfyUI 一体机 + 技术复盘**
 
-Runs **MiniMax H3** text/image → **video + audio** on an NVIDIA Thor (sm_110) with native int8/fp8.
-在 NVIDIA Thor（sm_110）上以原生 int8/fp8 跑 **MiniMax H3** 文/图 → **视频 + 音频**。
+Runs **MiniMax H3** text/image → **video + audio** on an NVIDIA Thor (sm_101) with native int8/fp8.
+在 NVIDIA Thor（sm_101）上以原生 int8/fp8 跑 **MiniMax H3** 文/图 → **视频 + 音频**。
 
 </div>
 
@@ -16,7 +16,7 @@ Runs **MiniMax H3** text/image → **video + audio** on an NVIDIA Thor (sm_110) 
 
 | 🇨🇳 中文 | 🇬🇧 English |
 |---|---|
-| CUDA 12.8 下 Thor 报 **sm_101**，`comfy_kitchen` 的 CUDA 后端被**硬关闭**，int8 退化成 eager 反量化：慢（5 秒片段采样 ≈ 620 秒）且 **10 秒 OOM**。改用 **CUDA 13 前向兼容**让 Thor 报 **sm_110** → 启用**原生 int8/fp8**：**快 1.9 倍**、FP8 显存更低、**15 秒不 OOM**。FP8 + `--fast fp8_matrix_mult` + 8 步 LoRA 比 int8 4 步**又快又好**。 | Under CUDA 12.8 the Thor reports **sm_101** and `comfy_kitchen`'s CUDA backend is **hard-disabled**, so int8 falls back to eager dequant: slow (5 s clip ≈ 620 s sampling) and **OOM at 10 s**. Booting under **CUDA 13 forward-compat** makes it report **sm_110** → **native int8/fp8**: **1.9× faster**, lower FP8 memory, **no OOM to 15 s**. FP8 + `--fast fp8_matrix_mult` + an 8-step LoRA beats the int8 4-step baseline on **both speed and quality**. |
+| 芯片是 **NVIDIA Thor（sm_101）**。CUDA 12.8 下 `comfy_kitchen` 的版本门（`<13`）把 CUDA 后端**硬关闭**，int8 退化成 eager 反量化：慢（5 秒片段采样 ≈ 620 秒）且 **10 秒 OOM**。改用 **CUDA 13 前向兼容**（同一颗 sm_101）通过版本门 → **启用原生 int8/fp8**：**快 1.9 倍**、FP8 显存更低、**15 秒不 OOM**。FP8 + `--fast fp8_matrix_mult` + 8 步 LoRA 比 int8 4 步**又快又好**。 | The chip is **NVIDIA Thor (sm_101)**. Under CUDA 12.8 `comfy_kitchen`'s version gate (`<13`) **hard-disables** its CUDA backend, so int8 falls back to eager dequant: slow (5 s clip ≈ 620 s sampling) and **OOM at 10 s**. Booting under **CUDA 13 forward-compat** (same sm_101 chip) passes the gate → **native int8/fp8**: **1.9× faster**, lower FP8 memory, **no OOM to 15 s**. FP8 + `--fast fp8_matrix_mult` + an 8-step LoRA beats the int8 4-step baseline on **both speed and quality**. |
 
 ## 性能对比 · Benchmark
 
@@ -25,8 +25,8 @@ Runs **MiniMax H3** text/image → **video + audio** on an NVIDIA Thor (sm_110) 
 | 配置 Config | CUDA / 架构 arch | DiT | 步 Steps | 5s 采样 sample | 峰值 peak | 10s | 15s |
 |---|---|---|---|---|---|---|---|
 | 基线 Baseline | 12.8 / sm_101 | int8_convrot 34 GB | 4 | 620 s | 34.8 GB | ❌ OOM | ❌ OOM |
-| cu130 int8 | 13.0 / sm_110 | int8_convrot 34 GB | 4 | **331 s** | 55.6 GB | ✅ | ✅ |
-| ⭐ cu130 fp8 | 13.0 / sm_110 | fp8_scaled 19.5 GB | 8 | **281 s** | **48.9 GB** | ✅ | ✅ |
+| cu130 int8 | 13.0 / sm_101 | int8_convrot 34 GB | 4 | **331 s** | 55.6 GB | ✅ | ✅ |
+| ⭐ cu130 fp8 | 13.0 / sm_101 | fp8_scaled 19.5 GB | 8 | **281 s** | **48.9 GB** | ✅ | ✅ |
 
 ⭐ = 生产配方 production recipe（FP8 + 8-step LoRA + audio）。
 

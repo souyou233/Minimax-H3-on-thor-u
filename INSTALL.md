@@ -1,4 +1,4 @@
-# MiniMax H3 Video Generation — cu130 Appliance (NVIDIA Thor / sm_110)
+# MiniMax H3 Video Generation — cu130 Appliance (NVIDIA Thor / sm_101)
 
 Self-contained ComfyUI appliance that runs **MiniMax H3** text/image→video+audio with a
 **cu130 (CUDA 13.0)** PyTorch stack and **native int8/fp8** kernels (comfy_kitchen CUDA
@@ -33,7 +33,7 @@ comfy-h3-cu130/
 
 ## 2. Prerequisites (check before installing)
 
-- **Hardware:** NVIDIA **Thor (compute capability sm_110)**, aarch64/ARM64. (Verified on the
+- **Hardware:** NVIDIA **Thor (compute capability sm_101)**, aarch64/ARM64. (Verified on the
   Zeekr Thor-U. Jetson Thor dev kits with the same driver stack should work.)
 - **OS / driver:** aarch64 Linux with the NVIDIA GPU userspace (`libnvrm_*` present under
   `/usr/lib`) and a kernel driver new enough for **CUDA 13 forward-compatibility** (the
@@ -137,7 +137,8 @@ ffmpeg -i <file>.mp4 2>&1 | grep -E 'Stream|Duration'
   `/workspace/models/h3`; config from `./app` at `/workspace/app`.
 - **cu130 activation:** `app/start_comfy_cu130.sh` puts `/compat` (CUDA-13 `libcuda.so.1`)
   **first** on `LD_LIBRARY_PATH`, keeping the system `libnvrm_*` from `/host_lib`. Under CUDA 13
-  the GPU reports **sm_110** and comfy_kitchen's CUDA backend enables native int8/fp8.
+  the toolkit passes comfy_kitchen's `cuda_version < (13,)` gate, so its CUDA backend enables native
+  int8/fp8 (the chip stays **sm_101**).
 - **FP8 speed:** launched with `--fast fp8_matrix_mult`. Do **not** add `--lowvram/--novram`.
 - **Audio:** the KSampler produces an AV latent (video+audio). `LTXVAudioVAEDecode` takes the
   whole latent and `unbind()[-1]` extracts the audio; the audio VAE is loaded with a **plain

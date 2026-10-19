@@ -1,4 +1,4 @@
-# 在 NVIDIA Thor（sm_110）上用 CUDA 13 跑 MiniMax H3 —— 实战复盘
+# 在 NVIDIA Thor（sm_101）上用 CUDA 13 跑 MiniMax H3 —— 实战复盘
 
 > 本页是 [GUIDE.md](GUIDE.md) 的中文版。
 
@@ -6,9 +6,10 @@
 的完整生产复盘：从 CUDA 12.8 迁移到 CUDA 13 从而解锁原生 int8/fp8 内核、各模型配置的速度/显存
 实测、以及一路踩过的坑。
 
-> **一句话结论** —— 在 CUDA 12.8 下 Thor 报 **sm_101**，`comfy_kitchen` 的 CUDA 后端被**硬关闭**，
-> int8 权重退化成 eager 反量化：慢（5 秒片段采样 ≈ 620 秒）且 **10 秒就 OOM**。把同一套栈放到
-> **CUDA 13 前向兼容**下运行，Thor 报 **sm_110**，从而**启用** CUDA 后端 → **原生 int8/fp8**。
+> **一句话结论** —— 芯片是 **NVIDIA Thor（sm_101）**。在 CUDA 12.8 下 `comfy_kitchen` 的
+> `cuda_version < (13,)` 版本门把 CUDA 后端**硬关闭**，int8 权重退化成 eager 反量化：慢（5 秒片段
+> 采样 ≈ 620 秒）且 **10 秒就 OOM**。把同一套栈放到 **CUDA 13 前向兼容**下运行，通过该版本门 →
+> CUDA 后端**启用原生 int8/fp8**（同一颗 sm_101）。
 > 结果：**快 1.9 倍**、FP8 显存更低、**15 秒都不 OOM**。FP8 + `--fast fp8_matrix_mult` + 8 步 LoRA
 > 比 int8 4 步基线**又快又好**。
 
@@ -19,7 +20,7 @@
 | | |
 |---|---|
 | SoC | NVIDIA **Thor**（Blackwell 数据中心/车载线），aarch64 |
-| 计算能力 | CUDA 12.8 下 **sm_101** · CUDA 13.0 下 **sm_110** |
+| 计算能力 | **sm_101**（Thor）—— 跨 CUDA 版本不变；变量是 CUDA 工具链版本，不是架构 |
 | 内存 | **60 GB 统一内存**（CPU/GPU 共享）；由 `comfy-aimdo` 管理 |
 | 软件栈 | ComfyUI 0.34 · `comfy_kitchen` 0.2.31 · `comfy-aimdo` · torch 2.13.0+cu130 |
 | 模型 | MiniMax H3（`FLOW_AV`）：AV latent = `NestedTensor(视频[B,24,T,H/16,W/16], 音频[B,32,2,T40])` |
@@ -54,7 +55,7 @@ if cuda_version < (13,):
 
 ---
 
-## 3. 解法：CUDA 13 前向兼容 → sm_110 → 原生 int8/fp8
+## 3. 解法：CUDA 13 前向兼容 → CUDA 后端开启 → 原生 int8/fp8
 
 车机的内核 GPU 驱动是 CUDA-12 时代的，但 NVIDIA 提供了一份 **CUDA 13 前向兼容的 `libcuda.so.1`**
 （外加 JIT 伴生库：`libnvidia-ptxjitcompiler`、`libnvidia-nvvm` 等）。把它放到 `LD_LIBRARY_PATH`
@@ -70,7 +71,7 @@ export LD_LIBRARY_PATH=/compat:$LD_LIBRARY_PATH:/host_lib:/host_thor_lib:/host_c
 确认 CUDA 13 生效：
 
 ```
-cuInit rc=0 · cuDriverGetVersion = 13020 · torch.cuda.get_device_capability() = (11, 0)  # sm_110
+cuInit rc=0 · cuDriverGetVersion = 13020（CUDA 13）· 设备 = NVIDIA Thor（sm_101）
 Found comfy_kitchen backend cuda: {'available': True, 'disabled': False, ...}
 Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorwise, asym_w4a8_int8
 ```
@@ -79,8 +80,8 @@ Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorw
 两颗"这颗芯片根本没发布对应 SASS"也能跑起来的定心丸：
 
 - **PTX JIT**：`comfy_kitchen` 的 aarch64 wheel 带的是 `sm_100`/`sm_120` cubin + PTX；CUDA-13 的 JIT
-  编译器在加载时把 PTX 编到 **sm_110**。（实测确认：为 sm_100/sm_120 编的内核在 sm_110 上正确运行。）
-- **注意力**：PyTorch SDPA 的 **FLASH 后端在 sm_110 上可用**（`sdpa_kernel([FLASH_ATTENTION])` 成功），
+  编译器在加载时把 PTX 编到 **sm_101**。（实测确认：为 sm_100/sm_120 编的内核在 sm_101 上正确运行。）
+- **注意力**：PyTorch SDPA 的 **FLASH 后端在 sm_101 上可用**（`sdpa_kernel([FLASH_ATTENTION])` 成功），
   所以 ComfyUI 默认的 `Using pytorch attention` 其实已经走 flash。不需要 `sageattention`——它也没用
   （见 §5.3）。
 
@@ -91,8 +92,8 @@ Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorw
 | 配置 | CUDA / 架构 | DiT | 步数 | 5s 采样 | 5s 合计 | 峰值显存 | 10s | 15s |
 |---|---|---|---|---|---|---|---|---|
 | **基线** | 12.8 / sm_101 | int8_convrot (34 GB) | 4 | 620s | 696s | 34.8 GB | **OOM** | **OOM** |
-| **cu130 int8** | 13.0 / sm_110 | int8_convrot (34 GB) | 4 | **331s** | **369s** | 55.6 GB | 656s ✓ | 1088s + 78s ✓ |
-| **cu130 fp8** ⭐ | 13.0 / sm_110 | fp8_scaled (19.5 GB) | 8 | **281s** | ~391s | **48.9 GB** | ✓ | ✓ |
+| **cu130 int8** | 13.0 / sm_101 | int8_convrot (34 GB) | 4 | **331s** | **369s** | 55.6 GB | 656s ✓ | 1088s + 78s ✓ |
+| **cu130 fp8** ⭐ | 13.0 / sm_101 | fp8_scaled (19.5 GB) | 8 | **281s** | ~391s | **48.9 GB** | ✓ | ✓ |
 
 ⭐ = 当前生产配方（`--fast fp8_matrix_mult`、8 步 turbo LoRA、音频开）。
 
@@ -117,7 +118,7 @@ Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorw
   用 **0.2.31**（第一个带全套能力位的 aarch64 cu130 wheel）。
 - **compat libcuda 的顺序。** 如果宿主的 `libcuda.so.1` 在 `LD_LIBRARY_PATH` 上赢了，你会**悄悄**又跑回
   CUDA 12（后端关闭、eager 回退）。`/compat` 必须在最前；绝不要把宿主 libcuda `cp` 进镜像。
-- **没有 sm_110 cubin 没关系。** 别去为 sm_110 重编 `comfy_kitchen`——sm_100/120 的 PTX 会正确 JIT。
+- **没有 sm_101 cubin 没关系。** 别去为 sm_101 重编 `comfy_kitchen`——sm_100/120 的 PTX 会正确 JIT。
   重编纯属浪费几小时。
 - **`docker commit` 会把 `ENTRYPOINT=["bash"]` 烤进镜像**（继承自某次 `--entrypoint bash` 运行）。于是
   systemd 的 `ExecStart` 写成 `… 镜像 bash /script.sh` 就变成 `bash bash /script.sh` →
@@ -139,10 +140,10 @@ Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorw
 
 ### 5.3 注意力
 - **Sage Attention 在 Thor 上是死路。** `sageattention` wheel 只有 `_qattn_sm80/_sm89/_sm90`——
-  **没有 sm_100/sm_110**——根本加载不了。`comfy_kitchen` 有个 `int8_attention` 符号，但 0.2.31 里没给
-  sm_110 注册。
+  **没有 sm_100/sm_101**——根本加载不了。`comfy_kitchen` 有个 `int8_attention` 符号，但 0.2.31 里没给
+  sm_101 注册。
 - **你其实已经有 flash 了。** `torch.backends.cuda.flash_sdp_enabled()` 为 True，FLASH SDPA 后端在
-  sm_110 上能跑，所以默认后端已经是快速路径。别再追 Sage 了。
+  sm_101 上能跑，所以默认后端已经是快速路径。别再追 Sage 了。
 
 ### 5.4 音频（AV 分支）
 - **老的"音频 = 整机冻死"红线是 CUDA-12.8 的问题。** cu128 上 AV 采样分支 5/5 冻机。在 **cu130 上

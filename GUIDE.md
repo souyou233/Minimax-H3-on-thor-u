@@ -1,4 +1,4 @@
-# Running MiniMax H3 on NVIDIA Thor (sm_110) with CUDA 13 — a field guide
+# Running MiniMax H3 on NVIDIA Thor (sm_101) with CUDA 13 — a field guide
 
 > 中文版见 **[GUIDE.zh.md](GUIDE.zh.md)**。
 
@@ -7,10 +7,11 @@ A production write-up of running the **MiniMax H3** audio-video diffusion model
 including the CUDA-12.8 → CUDA-13 migration that unlocked native int8/fp8 kernels, measured
 speed/memory across model configs, and the full list of gotchas hit along the way.
 
-> **TL;DR** — On CUDA 12.8 the Thor reports **sm_101** and `comfy_kitchen`'s CUDA backend is
-> *hard-disabled*, so int8 weights fall back to eager dequant: slow (5 s clip ≈ 620 s sampling)
-> and it **OOMs at 10 s**. Booting the same stack under **CUDA 13 forward-compatibility** makes
-> the Thor report **sm_110**, which *enables* the CUDA backend → **native int8/fp8**. Result:
+> **TL;DR** — The chip is **NVIDIA Thor (sm_101)**. On CUDA 12.8 `comfy_kitchen`'s
+> `cuda_version < (13,)` gate *hard-disables* its CUDA backend, so int8 weights fall back to eager
+> dequant: slow (5 s clip ≈ 620 s sampling) and it **OOMs at 10 s**. Booting the same stack under
+> **CUDA 13 forward-compatibility** passes that gate → the CUDA backend *enables* **native int8/fp8**
+> (same sm_101 chip). Result:
 > **1.9× faster**, lower memory with FP8, and **no OOM up to 15 s**. FP8 + `--fast fp8_matrix_mult`
 > + an 8-step LoRA is both faster *and* higher quality than the int8 4-step baseline.
 
@@ -21,7 +22,7 @@ speed/memory across model configs, and the full list of gotchas hit along the wa
 | | |
 |---|---|
 | SoC | NVIDIA **Thor** (Blackwell datacenter/auto line), aarch64 |
-| Compute capability | **sm_101** under CUDA 12.8 · **sm_110** under CUDA 13.0 |
+| Compute capability | **sm_101** (Thor) — constant across CUDA versions; the CUDA toolkit version, not the arch, is the lever |
 | Memory | **60 GB unified** (CPU+GPU shared); `comfy-aimdo` manages it |
 | Stack | ComfyUI 0.34 · `comfy_kitchen` 0.2.31 · `comfy-aimdo` · torch 2.13.0+cu130 |
 | Model | MiniMax H3 (`FLOW_AV`): AV latent = `NestedTensor(video[B,24,T,H/16,W/16], audio[B,32,2,T40])` |
@@ -57,7 +58,7 @@ encode 28 s · sample 620 s · decode 36 s  →  total 696 s   peak ~34.8 GB
 
 ---
 
-## 3. The fix: CUDA 13 forward-compat → sm_110 → native int8/fp8
+## 3. The fix: CUDA 13 forward-compat → CUDA backend on → native int8/fp8
 
 The car's kernel GPU driver is CUDA-12-era, but NVIDIA ships a **CUDA 13 forward-compat
 `libcuda.so.1`** (+ JIT companions: `libnvidia-ptxjitcompiler`, `libnvidia-nvvm`, …). Load it
@@ -73,7 +74,7 @@ export LD_LIBRARY_PATH=/compat:$LD_LIBRARY_PATH:/host_lib:/host_thor_lib:/host_c
 Verification that CUDA 13 is live:
 
 ```
-cuInit rc=0 · cuDriverGetVersion = 13020 · torch.cuda.get_device_capability() = (11, 0)  # sm_110
+cuInit rc=0 · cuDriverGetVersion = 13020 (CUDA 13) · device = NVIDIA Thor (sm_101)
 Found comfy_kitchen backend cuda: {'available': True, 'disabled': False, ...}
 Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorwise, asym_w4a8_int8
 ```
@@ -82,9 +83,9 @@ Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorw
 (no eager dequant). Two things make this work on a chip whose SASS isn't shipped:
 
 - **PTX JIT**: the `comfy_kitchen` aarch64 wheel ships `sm_100`/`sm_120` cubins + PTX; the CUDA-13
-  JIT compiler compiles PTX down to **sm_110** at load. (Empirically confirmed: kernels built for
-  sm_100/sm_120 run correctly on sm_110.)
-- **Attention**: PyTorch SDPA's **FLASH backend works on sm_110** (`sdpa_kernel([FLASH_ATTENTION])`
+  JIT compiler compiles PTX down to **sm_101** at load. (Empirically confirmed: kernels built for
+  sm_100/sm_120 run correctly on sm_101.)
+- **Attention**: PyTorch SDPA's **FLASH backend works on sm_101** (`sdpa_kernel([FLASH_ATTENTION])`
   succeeds), so ComfyUI's default `Using pytorch attention` already dispatches to flash. No
   `sageattention` needed — and it wouldn't help anyway (see §5.3).
 
@@ -95,8 +96,8 @@ Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorw
 | Config | CUDA / arch | DiT | Steps | 5 s sample | 5 s total | Peak mem | 10 s | 15 s |
 |---|---|---|---|---|---|---|---|---|
 | **Baseline** | 12.8 / sm_101 | int8_convrot (34 GB) | 4 | 620 s | 696 s | 34.8 GB | **OOM** | **OOM** |
-| **cu130 int8** | 13.0 / sm_110 | int8_convrot (34 GB) | 4 | **331 s** | **369 s** | 55.6 GB | 656 s ✓ | 1088 s + 78 s ✓ |
-| **cu130 fp8** ⭐ | 13.0 / sm_110 | fp8_scaled (19.5 GB) | 8 | **281 s** | ~391 s | **48.9 GB** | ✓ | ✓ |
+| **cu130 int8** | 13.0 / sm_101 | int8_convrot (34 GB) | 4 | **331 s** | **369 s** | 55.6 GB | 656 s ✓ | 1088 s + 78 s ✓ |
+| **cu130 fp8** ⭐ | 13.0 / sm_101 | fp8_scaled (19.5 GB) | 8 | **281 s** | ~391 s | **48.9 GB** | ✓ | ✓ |
 
 ⭐ = current production recipe (`--fast fp8_matrix_mult`, 8-step turbo LoRA, audio on).
 
@@ -125,7 +126,7 @@ Reading the table:
 - **compat libcuda ordering.** If the host `libcuda.so.1` wins on `LD_LIBRARY_PATH`, you silently
   run CUDA 12 again (backend disabled, eager fallback). Keep `/compat` first; never `cp` the host
   libcuda into the image.
-- **No sm_110 cubin is fine.** Don't try to rebuild `comfy_kitchen` for sm_110 — the sm_100/120
+- **No sm_101 cubin is fine.** Don't try to rebuild `comfy_kitchen` for sm_101 — the sm_100/120
   PTX JITs correctly. Rebuilding wastes hours.
 - **`docker commit` bakes `ENTRYPOINT=["bash"]`** (inherited from a `--entrypoint bash` run). A
   systemd `ExecStart` of `… image bash /script.sh` then runs `bash bash /script.sh` →
@@ -149,10 +150,10 @@ Reading the table:
 
 ### 5.3 Attention
 - **Sage Attention is a dead end on Thor.** The `sageattention` wheel only ships
-  `_qattn_sm80/_sm89/_sm90` — **no sm_100/sm_110** — so it can't load. `comfy_kitchen` has an
-  `int8_attention` symbol but it isn't registered for sm_110 in 0.2.31.
+  `_qattn_sm80/_sm89/_sm90` — **no sm_100/sm_101** — so it can't load. `comfy_kitchen` has an
+  `int8_attention` symbol but it isn't registered for sm_101 in 0.2.31.
 - **You already have flash.** `torch.backends.cuda.flash_sdp_enabled()` is True and the FLASH SDPA
-  backend runs on sm_110, so the default backend is already the fast path. Don't chase Sage.
+  backend runs on sm_101, so the default backend is already the fast path. Don't chase Sage.
 
 ### 5.4 Audio (the AV branch)
 - **The old "audio = machine freeze" red line was a CUDA-12.8 problem.** On cu128 the AV sampling
