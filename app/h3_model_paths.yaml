@@ -1,0 +1,5 @@
+h3:
+  diffusion_models: /workspace/models/h3/diffusion_models
+  loras: /workspace/models/h3/loras
+  text_encoders: /workspace/models/h3/text_encoders
+  vae: /workspace/models/h3/vae

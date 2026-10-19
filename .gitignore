@@ -1,0 +1,7 @@
+# Large binaries distributed separately (网盘 / comfy-h3-cu130.tar) — not in git
+*.tar.gz
+*.tar
+*.safetensors
+comfyui/
+compat_libs/
+__pycache__/
