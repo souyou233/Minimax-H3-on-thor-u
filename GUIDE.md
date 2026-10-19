@@ -1,5 +1,7 @@
 # Running MiniMax H3 on NVIDIA Thor (sm_110) with CUDA 13 — a field guide
 
+> 中文版见 **[GUIDE.zh.md](GUIDE.zh.md)**。
+
 A production write-up of running the **MiniMax H3** audio-video diffusion model
 (text/image → video + audio) on an **NVIDIA Thor** SoC (the Zeekr Thor-U automotive unit),
 including the CUDA-12.8 → CUDA-13 migration that unlocked native int8/fp8 kernels, measured

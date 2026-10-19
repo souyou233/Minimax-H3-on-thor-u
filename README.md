@@ -3,7 +3,7 @@
 一个自包含的 ComfyUI 一体机：在 **cu130（CUDA 13.0）** 上跑 **MiniMax H3** 文/图→视频+音频，
 用 **FP8 DiT + 8步 turbo LoRA**，原生 int8/fp8 内核，输出**带音频的 MP4**。
 
-> 详细安装见 **[INSTALL.md](INSTALL.md)**（给 AI 自动执行）；完整技术复盘、cu 版本与不同模型配置的速度/显存对比、踩坑清单见 **[GUIDE.md](GUIDE.md)**。本文件是给人看的速览。
+> 详细安装见 **[INSTALL.md](INSTALL.md)**（给 AI 自动执行）；完整技术复盘、cu 版本与不同模型配置的速度/显存对比、踩坑清单见 **[GUIDE.zh.md](GUIDE.zh.md)**（中文）/ [GUIDE.md](GUIDE.md)（English）。本文件是给人看的速览。
 
 ## 包内容
 | 路径 | 说明 |
