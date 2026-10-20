@@ -86,8 +86,9 @@ Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorw
   JIT compiler compiles PTX down to **sm_101** at load. (Empirically confirmed: kernels built for
   sm_100/sm_120 run correctly on sm_101.)
 - **Attention**: PyTorch SDPA's **FLASH backend works on sm_101** (`sdpa_kernel([FLASH_ATTENTION])`
-  succeeds), so ComfyUI's default `Using pytorch attention` already dispatches to flash. No
-  `sageattention` needed — and it wouldn't help anyway (see §5.3).
+  succeeds), so ComfyUI's default attention already dispatches to flash — the *dense* fast path. A
+  quantized *dense* SageAttention barely beats it (~1.1×); the real lever is **block-sparse**
+  SpargeAttn (~1.8× end-to-end), which you build yourself — see §5.3.
 
 ---
 
@@ -100,6 +101,10 @@ Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorw
 | **cu130 fp8** ⭐ | 13.0 / sm_101 | fp8_scaled (19.5 GB) | 8 | **281 s** | ~391 s | **48.9 GB** | ✓ | ✓ |
 
 ⭐ = current production recipe (`--fast fp8_matrix_mult`, 8-step turbo LoRA, audio on).
+
+> **Block-sparse attention (opt-in) adds ~1.8× on top** of the ⭐ recipe — see §5.3. It is measured
+> end-to-end (encode + sample + decode), so it is intentionally *not* a row in the sampling table
+> above; the sampling-phase gain alone is larger than the 1.8× headline.
 
 Reading the table:
 
@@ -148,12 +153,36 @@ Reading the table:
   FP8 file (`…pruned_fp8_scaled…` contains `"pruned"` → treated as the tiny nvfp4 budget → a
   768×432×124 job gets rejected). Match on `"fp8"` explicitly.
 
-### 5.3 Attention
-- **Sage Attention is a dead end on Thor.** The `sageattention` wheel only ships
-  `_qattn_sm80/_sm89/_sm90` — **no sm_100/sm_101** — so it can't load. `comfy_kitchen` has an
-  `int8_attention` symbol but it isn't registered for sm_101 in 0.2.31.
-- **You already have flash.** `torch.backends.cuda.flash_sdp_enabled()` is True and the FLASH SDPA
-  backend runs on sm_101, so the default backend is already the fast path. Don't chase Sage.
+### 5.3 Attention — dense flash is the floor; block-sparse is the lever
+- **Dense fast path = flash SDPA.** `torch.backends.cuda.flash_sdp_enabled()` is True and the FLASH
+  SDPA backend runs on this chip, so ComfyUI's default attention is already dense-optimal.
+- **The stock wheels don't load, but you can build from source.** The `sageattention` / `SpargeAttn`
+  pip wheels ship only `_qattn_sm80/_sm89/_sm90` — **no sm_100/sm_101** — so they can't import, and
+  `comfy_kitchen`'s `int8_attention` isn't registered for sm_101 either. Fix: build the CUDA ext
+  against the device (`nvcc` 13 is in the image) with **no `TORCH_CUDA_ARCH_LIST`** so it
+  auto-detects the arch, plus two small `setup.py` patches — an arch branch (upstream `SUPPORTED_ARCHS`
+  omits this chip) and dropping `-Xcompiler -include,cassert` (it breaks CUDA-13/GCC-13's
+  `<c++config.h>`).
+- **Dense quantization ≠ a win here.** Built-for-device dense SageAttention is only **~1.09–1.17×**
+  over flash (int8-QK + fp16-PV); its fp8 path is actually **slower** (0.86–0.96×). The Blackwell
+  flash kernel is already strong, so a dense quantization has little left to give.
+- **Block-sparse is the win.** **SpargeAttn** (`spas_sage2_attn_meansim_topk_cuda`, int8-QK + FP8-PV
+  via the Sage2++ path) is **~2.4–2.6×** at topk=0.3 in an isolated hd128 16k/32k-token micro-bench,
+  and **~1.8× end-to-end** on real clips (768×432×5s, same seed: **271.8 s → 151.3 s**). End-to-end
+  includes the *unchanged* text-encode + VAE-decode stages, so the sampling-phase speedup is larger
+  than the 1.8× headline.
+- **How it's wired (no ComfyUI fork):** launch with `--use-sage-attention` (ComfyUI routes
+  `optimized_attention → attention_sage`, which already handles H3's `AttentionTensorContainer`/HND
+  layout and has a pytorch fallback), and drop a thin `sageattention.py` **shim** in the ComfyUI cwd
+  whose `sageattn()` calls SpargeAttn and falls back to exact SDPA on *any* error. So you need only
+  `spas_sage_attn` + the shim — **not** the real `sageattention` package.
+- **Gotchas.** SpargeAttn's top-k path uses `km` unconditionally, so it **requires `smooth_k=True`**
+  (ComfyUI passes `smooth_k=False` → `UnboundLocalError: km`; the shim forces it True). Short
+  sequences (`seq_len < 128`, e.g. the audio-branch attention) assert and auto-fall-back to SDPA —
+  harmless. Tune/disable live via a toggle file (see INSTALL §8), no restart.
+- **Caveat.** Validated on a calm-camera clip (no visible quality loss, deterministic output); push
+  harder (higher sparsity, fast motion, fine detail) and spot-check. Sparse attention also nudges the
+  diffusion trajectory, so output is intentionally *not* pixel-identical to the flash baseline.
 
 ### 5.4 Audio (the AV branch)
 - **The old "audio = machine freeze" red line was a CUDA-12.8 problem.** On cu128 the AV sampling
@@ -207,6 +236,11 @@ exec python3 main.py --listen 0.0.0.0 --port 8189 --enable-cors-header \
 Default recipe: FP8 DiT + `turbo_8step_v1.0`, `steps=8`, `cfg=1.0`,
 `MiniMaxH3SigmaShift(shift_video=12.0, shift_audio=3.0)`, euler/normal.
 
+> **Optional ~1.8× block-sparse attention**: add `--use-sage-attention` and drop `app/sageattention.py`
+> (the shim) + the prebuilt `app/spas_sage_attn/` (included in this package; rebuild only for a
+> different arch) into the ComfyUI dir (`/workspace/comfyui`). It is **off by default in this
+> template**; our production deployment runs it **on** at `topk=0.3`. Details: §5.3 and INSTALL §8.
+
 ---
 
 ## 7. Numbers appendix
@@ -218,6 +252,10 @@ Default recipe: FP8 DiT + `turbo_8step_v1.0`, `steps=8`, `cfg=1.0`,
 | cu128 → cu130 sample speedup (int8, 5 s) | 620 → 331 s (**1.87×**) |
 | cu128 → cu130 total speedup (int8, 5 s) | 696 → 369 s (**1.89×**) |
 | FP8 8-step sample (5 s) | 281 s (faster than int8 4-step) |
+| Dense SageAttention (built for device) vs flash | ~1.09–1.17× (int8+fp16); fp8 0.86–0.96× (slower) |
+| SpargeAttn topk=0.3 — isolated attn (hd128, 16k/32k tok) | ~2.42–2.62× vs flash SDPA |
+| SpargeAttn topk=0.3 — end-to-end (768×432×5s, same seed) | 271.8 s → 151.3 s (**~1.80×**) |
+| SpargeAttn topk=0.5 — end-to-end (same) | 271.8 s → 166.4 s (1.63×) |
 | Peak mem, int8 cu130 | 55.6 GB (aimdo cap) |
 | Peak mem, FP8 cu130 | 48.9 GB |
 | Max clip without OOM | 15 s (362 frames) on cu130; 5 s on cu128 |

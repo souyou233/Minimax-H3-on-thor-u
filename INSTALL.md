@@ -148,7 +148,64 @@ ffmpeg -i <file>.mp4 2>&1 | grep -E 'Stream|Duration'
 - **Default recipe:** FP8 DiT + `turbo_8step_v1.0` LoRA, `steps=8`, `cfg=1.0`,
   `MiniMaxH3SigmaShift shift_video=12.0 shift_audio=3.0`, euler/normal.
 
-## 8. Troubleshooting
+## 8. Optional — block-sparse attention (SpargeAttn, ~1.8×)
+
+By default attention runs on flash SDPA (already dense-optimal here). A **block-sparse** kernel
+(SpargeAttn: int8-QK + FP8-PV, the Sage2++ path) adds **~1.8× end-to-end** on top with no visible
+quality loss at `topk=0.3` (same-seed 768×432×5s: 271.8 s → 151.3 s). It is **opt-in** because the
+kernel must be compiled for this device; our production deployment ships it enabled. Skip this whole
+section to stay on flash — nothing else changes.
+
+**A prebuilt kernel is included:** `app/spas_sage_attn/` holds a ready aarch64 (sm_101) build. Copy
+the package + the shim into the ComfyUI dir — no build needed:
+
+```bash
+cp -r app/spas_sage_attn    comfyui/spas_sage_attn
+cp    app/sageattention.py  comfyui/sageattention.py
+```
+
+**Rebuild only if your device arch differs** (the wheel ships no sm_100/sm_101 cubins and the venv
+has no pip, so build in-place inside the container, where `nvcc` 13 is present; do **not** set
+`TORCH_CUDA_ARCH_LIST` — leave it unset so it auto-detects the device arch):
+
+```bash
+# inside the ComfyUI container (see run.sh), from a writable dir
+git clone https://github.com/thu-ml/SpargeAttn.git && cd SpargeAttn
+# patch setup.py: delete the "-Xcompiler","-include,cassert" entry from NVCC_FLAGS
+#   (that CUDA-12 include hack breaks CUDA-13/GCC-13's <c++config.h>)
+python3 setup.py build_ext --inplace            # builds spas_sage_attn/_qattn*.so for this device
+# make it importable from the ComfyUI cwd + install the shim (both go into the mounted ./comfyui):
+cp -r spas_sage_attn ../comfyui/spas_sage_attn
+cp ../app/sageattention.py ../comfyui/sageattention.py
+```
+
+Then enable it: add `--use-sage-attention` to `app/start_comfy_cu130.sh` (the launcher carries it as
+a commented hint) and restart ComfyUI. That flag makes ComfyUI route attention through
+`attention_sage`; the `sageattention.py` shim stands in for the (uninstalled) `sageattention` package
+and calls SpargeAttn, falling back to exact SDPA on any error — so a bad/absent kernel can never
+break a render.
+
+**Live top-k toggle (no restart)** — the shim reads `/workspace/sparge_topk` on every call:
+
+```bash
+echo 0.3 > /workspace/sparge_topk    # enable at topk=0.3 (recommended, ~1.8×)
+echo 0.5 > /workspace/sparge_topk    # more conservative (~1.6×)
+echo 0   > /workspace/sparge_topk    # disable -> flash SDPA
+```
+
+A missing file defaults to `0.3`; `0`/`off`/empty → flash. Because it is read per call you can flip
+it between generations without restarting.
+
+**Notes / limits:**
+- The sparse path needs `smooth_k=True` (SpargeAttn uses `km` unconditionally); the shim forces it.
+- Attention with `seq_len < 128` (the audio branch) auto-falls-back to SDPA — harmless; expect a few
+  `[sageattn-shim] sparge failed -> sdpa: ... seq_len ...` log lines.
+- Attention speedups do **not** raise the memory ceiling (that is set by the DiT/VAE) — this is speed
+  only.
+- Quality was validated on a calm-camera clip; spot-check fast-motion / fine-detail scenes before
+  lowering top-k further.
+
+## 9. Troubleshooting
 
 | Symptom | Fix |
 |---|---|
@@ -158,9 +215,15 @@ ffmpeg -i <file>.mp4 2>&1 | grep -E 'Stream|Duration'
 | `VAE is invalid: None` on audio node | You used `LTXVAudioVAELoader`; switch to plain `VAELoader` for the audio VAE. |
 | OOM on long/high-res | Lower `length` (frames) or resolution; the FP8 run peaks ~49 GB at 768x432x124. |
 | Model not found in node dropdown | File missing or wrong subdir under `models/`; re-check Section 3 paths. |
+| `Using sage attention` but no speedup | SpargeAttn not built, or the shim not in the ComfyUI cwd. Place `sageattention.py` + `spas_sage_attn/` into `comfyui/` and add `--use-sage-attention` (§8). |
+| `UnboundLocalError: cannot access local variable 'km'` in the log | Old shim forwarded `smooth_k=False`; the shipped `app/sageattention.py` forces `smooth_k=True`. Update the shim. |
+| `[sageattn-shim] sparge failed -> sdpa: ... seq_len ... 128` | Normal — short (<128-token) audio-branch attention falls back to SDPA. No action. |
 
-## 9. Reference
+## 10. Reference
 
 - Models: HuggingFace `Comfy-Org/MiniMax-H3`.
+- Sparse attention: [thu-ml/SpargeAttn](https://github.com/thu-ml/SpargeAttn) (the top-k path we use)
+  and [thu-ml/SageAttention](https://github.com/thu-ml/SageAttention) (dense; the kernel base). Both
+  need the arch + CUDA-13 `setup.py` patches in §8 to build on this chip.
 - Measured on Zeekr Thor-U: 5s@768x432 sample ~281 s, peak ~49 GB; 10s/15s run without OOM.
 - Ports: ComfyUI `8189`. Output dir: `./comfyui/output` (inside the mounted code tree).

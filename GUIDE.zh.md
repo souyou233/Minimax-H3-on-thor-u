@@ -82,8 +82,8 @@ Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorw
 - **PTX JIT**：`comfy_kitchen` 的 aarch64 wheel 带的是 `sm_100`/`sm_120` cubin + PTX；CUDA-13 的 JIT
   编译器在加载时把 PTX 编到 **sm_101**。（实测确认：为 sm_100/sm_120 编的内核在 sm_101 上正确运行。）
 - **注意力**：PyTorch SDPA 的 **FLASH 后端在 sm_101 上可用**（`sdpa_kernel([FLASH_ATTENTION])` 成功），
-  所以 ComfyUI 默认的 `Using pytorch attention` 其实已经走 flash。不需要 `sageattention`——它也没用
-  （见 §5.3）。
+  所以 ComfyUI 默认注意力其实已经走 flash——这是**稠密**的快速路径。量化版的**稠密** SageAttention 也只
+  快约 ~1.1×；真正的杠杆是**块稀疏**的 SpargeAttn（端到端 ~1.8×），需自行编译——见 §5.3。
 
 ---
 
@@ -96,6 +96,9 @@ Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorw
 | **cu130 fp8** ⭐ | 13.0 / sm_101 | fp8_scaled (19.5 GB) | 8 | **281s** | ~391s | **48.9 GB** | ✓ | ✓ |
 
 ⭐ = 当前生产配方（`--fast fp8_matrix_mult`、8 步 turbo LoRA、音频开）。
+
+> **块稀疏注意力（可选）在 ⭐ 配方之上再加约 1.8×**——见 §5.3。它是**端到端**（编码+采样+解码）口径，
+> 故**不进**上面这张采样表；单看采样阶段的加速比 1.8× 的头条数字更大。
 
 怎么读这张表：
 
@@ -138,12 +141,31 @@ Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorw
   （`…pruned_fp8_scaled…` 里含 `"pruned"` → 被当成最小的 nvfp4 预算 → 768×432×124 的任务被拒）。
   要显式匹配 `"fp8"`。
 
-### 5.3 注意力
-- **Sage Attention 在 Thor 上是死路。** `sageattention` wheel 只有 `_qattn_sm80/_sm89/_sm90`——
-  **没有 sm_100/sm_101**——根本加载不了。`comfy_kitchen` 有个 `int8_attention` 符号，但 0.2.31 里没给
-  sm_101 注册。
-- **你其实已经有 flash 了。** `torch.backends.cuda.flash_sdp_enabled()` 为 True，FLASH SDPA 后端在
-  sm_101 上能跑，所以默认后端已经是快速路径。别再追 Sage 了。
+### 5.3 注意力 —— 稠密 flash 是地板，块稀疏才是杠杆
+- **稠密快速路径 = flash SDPA。** `torch.backends.cuda.flash_sdp_enabled()` 为 True，FLASH SDPA 后端
+  在本芯片能跑，所以 ComfyUI 的默认注意力已经是稠密最优。
+- **现成 wheel 装不上，但能从源码编。** `sageattention` / `SpargeAttn` 的 pip wheel 只有
+  `_qattn_sm80/_sm89/_sm90`——**没有 sm_100/sm_101**——import 不了；`comfy_kitchen` 的 `int8_attention`
+  在 0.2.31 也没给 sm_101 注册。解法：针对设备编 CUDA 扩展（镜像里有 `nvcc` 13），**不设
+  `TORCH_CUDA_ARCH_LIST`** 让它自动探测架构，外加两处小 `setup.py` 补丁——加一条架构分支（上游
+  `SUPPORTED_ARCHS` 没有这颗芯片），以及去掉 `-Xcompiler -include,cassert`（它在 CUDA-13/GCC-13 下会
+  弄坏 `<c++config.h>`）。
+- **稠密量化在这里不划算。** 为设备编好的稠密 SageAttention 只比 flash 快 **~1.09–1.17×**（int8-QK +
+  fp16-PV）；它的 fp8 路径反而**更慢**（0.86–0.96×）。Blackwell 的 flash kernel 本就很强，稠密量化
+  没什么可压榨的了。
+- **块稀疏才是赢点。** **SpargeAttn**（`spas_sage2_attn_meansim_topk_cuda`，int8-QK + FP8-PV 走
+  Sage2++ 路径）在隔离的 hd128 16k/32k token 微基准里 topk=0.3 有 **~2.4–2.6×**；真实片段上**端到端
+  ~1.8×**（768×432×5s，同 seed：**271.8s → 151.3s**）。端到端含**未变**的文本编码 + VAE 解码阶段，
+  所以采样阶段的加速比 1.8× 的头条更大。
+- **怎么接（不改 ComfyUI 源码）**：加 `--use-sage-attention` 启动（ComfyUI 把 `optimized_attention`
+  指向 `attention_sage`，它本就处理 H3 的 `AttentionTensorContainer`/HND 布局并带 pytorch 回退），再把
+  一个薄薄的 `sageattention.py` **shim** 放进 ComfyUI 工作目录，其 `sageattn()` 转调 SpargeAttn、
+  任何出错都退回精确 SDPA。所以只需 `spas_sage_attn` + 这个 shim——**不需要**真正的 `sageattention` 包。
+- **坑。** SpargeAttn 的 top-k 路径无条件用 `km`，故**要求 `smooth_k=True`**（ComfyUI 传的是
+  `smooth_k=False` → `UnboundLocalError: km`；shim 会强制置 True）。短序列（`seq_len < 128`，如音频支路
+  注意力）会断言失败并自动退回 SDPA——无害。可用开关文件实时调档/关闭（见 INSTALL §8），免重启。
+- **边界。** 只在平缓运镜的片段上验证过（无明显质量损失、输出确定）；更激进（更高稀疏度、快速运动、
+  细密纹理）要另测。稀疏注意力也会让扩散轨迹轻微偏移，故输出**有意**与 flash 基线不逐像素相同。
 
 ### 5.4 音频（AV 分支）
 - **老的"音频 = 整机冻死"红线是 CUDA-12.8 的问题。** cu128 上 AV 采样分支 5/5 冻机。在 **cu130 上
@@ -195,6 +217,10 @@ exec python3 main.py --listen 0.0.0.0 --port 8189 --enable-cors-header \
 默认配方：FP8 DiT + `turbo_8step_v1.0`，`steps=8`，`cfg=1.0`，
 `MiniMaxH3SigmaShift(shift_video=12.0, shift_audio=3.0)`，euler/normal。
 
+> **可选 ~1.8× 块稀疏注意力**：加 `--use-sage-attention`，并把 `app/sageattention.py`（shim）+ 自带的
+> 预编译内核 `app/spas_sage_attn/`（异架构才需自编译）放进 ComfyUI 目录（`/workspace/comfyui`）。本模板
+> **默认关**；我们的生产部署是 **开**着的（`topk=0.3`）。详见 §5.3 与 INSTALL §8。
+
 ---
 
 ## 7. 数据附录
@@ -206,6 +232,10 @@ exec python3 main.py --listen 0.0.0.0 --port 8189 --enable-cors-header \
 | cu128 → cu130 采样提速（int8，5s） | 620 → 331 秒（**1.87×**） |
 | cu128 → cu130 合计提速（int8，5s） | 696 → 369 秒（**1.89×**） |
 | FP8 8 步采样（5s） | 281 秒（比 int8 4 步还快） |
+| 稠密 SageAttention（为设备编）vs flash | ~1.09–1.17×（int8+fp16）；fp8 0.86–0.96×（更慢） |
+| SpargeAttn topk=0.3 — 隔离注意力（hd128，16k/32k token） | ~2.42–2.62×（对 flash SDPA） |
+| SpargeAttn topk=0.3 — 端到端（768×432×5s，同 seed） | 271.8s → 151.3s（**~1.80×**） |
+| SpargeAttn topk=0.5 — 端到端（同上） | 271.8s → 166.4s（1.63×） |
 | 峰值显存，int8 cu130 | 55.6 GB（aimdo 封顶） |
 | 峰值显存，FP8 cu130 | 48.9 GB |
 | 不 OOM 的最长片段 | cu130 可到 15 秒（362 帧）；cu128 只能 5 秒 |

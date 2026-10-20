@@ -30,6 +30,9 @@ Runs **MiniMax H3** text/image → **video + audio** on an NVIDIA Thor (sm_101) 
 
 ⭐ = 生产配方 production recipe（FP8 + 8-step LoRA + audio）。
 
+> 🔬 **稀疏注意力 · Sparse attention**：在上面这条生产配方之上，可再叠加 **SpargeAttn**（int8-QK + FP8-PV 块稀疏）——同 seed 端到端 **768×432×5s：271.8s → 151.3s（≈1.8×）**，肉眼无明显质量损失。**我们的部署默认开（topk=0.3）**；公共模板默认关（用 `--use-sage-attention` + `app/sageattention.py` shim + 自带预编译内核 `app/spas_sage_attn/` 开启，开关文件实时调档/关闭，免重启）。稠密量化 SageAttention 只有 ~1.1×（flash 已很快），**块稀疏才是杠杆**。详见 [GUIDE §5.3](GUIDE.md) / [INSTALL §8](INSTALL.md)。
+> 🔬 **Sparse attention**: optionally stack **SpargeAttn** (int8-QK + FP8-PV block-sparse) on top of the recipe — same seed, end-to-end **768×432×5s: 271.8s → 151.3s (≈1.8×)**, no visible quality loss. **Our deployment enables it by default (topk=0.3)**; the public template ships it off (enable with `--use-sage-attention` + the `app/sageattention.py` shim + the included prebuilt kernel `app/spas_sage_attn/`; a toggle file retunes/disables it live, no restart). Dense quantized SageAttention is only ~1.1× (flash is already fast) — **block-sparsity is the lever.** See [GUIDE §5.3](GUIDE.md) / [INSTALL §8](INSTALL.md).
+
 ## 快速开始 · Quick start
 
 ```bash
