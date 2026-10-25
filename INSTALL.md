@@ -21,15 +21,35 @@ comfy-h3-cu130/
 ├── run.sh                  <- start ComfyUI on :8189
 ├── SHA256SUMS              <- checksums of the 3 archives below
 ├── sample_workflow.json    <- a ready-to-run FP8+8step+audio test graph
-├── image/comfy-h3-cu130-v1.tar.gz   (~7.9 GB)  docker image (env: torch 2.13+cu130, comfy_kitchen, deps)
+├── image/comfy-h3-cu130-v1.tar.gz   (~8.5 GB; ships as five 2 GB parts — see §1.1)
 ├── compat/compat_cu130.tar.gz       (~0.2 GB)  CUDA-13 forward-compat libcuda + JIT companions
-├── code/h3_cu130_code.tar.gz        (~0.6 GB)  ComfyUI 0.34 source (incl. MiniMax H3 + audio nodes)
+├── code/h3_cu130_code.tar.gz        (~0.3 GB)  ComfyUI 0.34 source (incl. MiniMax H3 + audio nodes)
 ├── app/
 │   ├── h3_model_paths.yaml          model search paths (points at /workspace/models/h3/*)
 │   └── start_comfy_cu130.sh         container launcher (port 8189, --fast fp8_matrix_mult)
 └── models/               <- EMPTY by design; you download the 5 weights here (Section 3)
     ├── diffusion_models/  ├── loras/  ├── vae/  └── text_encoders/
 ```
+
+### 1.1 Getting the archives — GitHub Releases (no cloud drive)
+
+All big tarballs are **Release assets of this repo**, tag **`appliance-v1`**
+(<https://github.com/souyou233/Minimax-H3-on-thor-u/releases/tag/appliance-v1>).
+The docker image exceeds GitHub's 2 GB per-asset cap, so it ships as five parts to be re-joined:
+
+```bash
+BASE=https://github.com/souyou233/Minimax-H3-on-thor-u/releases/download/appliance-v1
+mkdir -p image code compat
+curl -L -o compat_cu130.tar.gz              $BASE/compat_cu130.tar.gz
+curl -L -o h3_cu130_code.tar.gz             $BASE/h3_cu130_code.tar.gz
+for i in 00 01 02 03 04; do curl -L -o img.part$i $BASE/comfy-h3-cu130-v1.tar.gz.part$i; done
+cat img.part00 img.part01 img.part02 img.part03 img.part04 > image/comfy-h3-cu130-v1.tar.gz && rm img.part0?
+curl -L -o SHASUMS-256.txt $BASE/SHASUMS-256.txt && sha256sum -c SHASUMS-256.txt
+mv compat_cu130.tar.gz compat/ ; mv h3_cu130_code.tar.gz code/
+```
+
+(The companion image backend repo shares the same release — `qwen_code_cu130.tar.gz` carries its
+ComfyUI-0.42 + ck-0.2.39 trees.)
 
 ## 2. Prerequisites (check before installing)
 

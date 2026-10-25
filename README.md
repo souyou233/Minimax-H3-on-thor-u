@@ -55,8 +55,11 @@ Runs **MiniMax H3** text/image → **video + audio** on an NVIDIA Thor (sm_101) 
 | `sample_workflow.json` | FP8+8步+音频 测试图 | FP8+8step+audio test graph |
 | `models/` | **空**，需自下 5 个模型 | **empty**; download 5 models |
 
-> ⚠️ 大二进制（镜像/compat/源码 tar）通过网盘/单文件分发，**不在 git 里**（GitHub 单文件 100 MB 上限）。
-> Large binaries are distributed separately (网盘 / `comfy-h3-cu130.tar`), **not in git** (GitHub 100 MB file limit).
+> 📦 大二进制（镜像/源码/compat tar）现在全部放在本仓库的 **GitHub Releases**（tag `appliance-v1`），不再走网盘。
+> 镜像超过 GitHub 单资产 2 GB 上限，拆成 `.part00`~`.part04` 五个资产，`cat` 合并后用 `SHASUMS-256.txt` 校验，详见 [INSTALL §1.1](INSTALL.md)。
+> 📦 All large binaries (docker image / ComfyUI source / CUDA-13 compat) now ship as **GitHub Release assets**
+> (tag `appliance-v1`) — no cloud drive. The image is split in five parts (2 GB per-asset cap): re-join with
+> `cat`, verify with `SHASUMS-256.txt`. See [INSTALL §1.1](INSTALL.md).
 
 ## 文档 · Documentation
 
