@@ -22,7 +22,7 @@
 | SoC | NVIDIA **Thor**（Blackwell 数据中心/车载线），aarch64 |
 | 计算能力 | **sm_101**（Thor）—— 跨 CUDA 版本不变；变量是 CUDA 工具链版本，不是架构 |
 | 内存 | **60 GB 统一内存**（CPU/GPU 共享）；由 `comfy-aimdo` 管理 |
-| 软件栈 | ComfyUI 0.34 · `comfy_kitchen` 0.2.31 · `comfy-aimdo` · torch 2.13.0+cu130 |
+| 软件栈 | ComfyUI **0.42.1**（2026-10 从 0.34 升级；工作流图不变） · `comfy_kitchen` 0.2.31 · `comfy-aimdo` · torch 2.13.0+cu130 |
 | 模型 | MiniMax H3（`FLOW_AV`）：AV latent = `NestedTensor(视频[B,24,T,H/16,W/16], 音频[B,32,2,T40])` |
 
 除特别说明，下文所有片段均为 **768×432、124 帧（5 秒 @ 24fps）、CFG 1.0、`shift_video=12`、euler/normal**。
@@ -166,6 +166,17 @@ Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorw
   注意力）会断言失败并自动退回 SDPA——无害。可用开关文件实时调档/关闭（见 INSTALL §8），免重启。
 - **边界。** 只在平缓运镜的片段上验证过（无明显质量损失、输出确定）；更激进（更高稀疏度、快速运动、
   细密纹理）要另测。稀疏注意力也会让扩散轨迹轻微偏移，故输出**有意**与 flash 基线不逐像素相同。
+- **2026-10-22 更新 —— 生产改用 Veda（学习式稀疏注意力）。** 固定 topk（0.3）在运动较多的片段上会
+  画出**横向条纹**。现在的杠杆是 **`VedaSparseAttention`** 自定义节点（包 `Veda-on-ComfyUI`）：由
+  **训练好的预测子**标记重要注意力 tile，只算这些 tile。接法：预测子
+  `minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors` 放 `comfyui/models/veda/`；节点接在
+  **LoRA 加载器之后、`MiniMaxH3SigmaShift` 之前**；调档走调度器 `profiles.json` 键 —— `veda_predictor`
+  （置了才启用）、可选 `veda_sparsity`/`veda_ref_sparsity`（默认 `"32"` 个 key-tile；整数不随分辨率缩放，
+  正好适配两步流的第一段）、`veda_dense_layers`/`veda_dense_steps`（默认全稀疏）、`veda_verbose`。
+  **核查方式**：运行日志出现 `Attention calls: N sparse`（N>0）才算生效。注意自带预测子是 *t2va*
+  打分器，用在 fl2va/ref2va 骨干属"域外"，新负载要看那条日志（节点还列了 r2va 预测子，未下载）。
+  SpargeAttn 路线**保留但已关停**：开关文件 `/zeekr_data/video_gen/sparge_topk` 置 `0`（精确 SDPA 基线），
+  `--use-sage-attention` 与 shim 作为无害回退留着。
 
 ### 5.4 音频（AV 分支）
 - **老的"音频 = 整机冻死"红线是 CUDA-12.8 的问题。** cu128 上 AV 采样分支 5/5 冻机。在 **cu130 上
@@ -187,6 +198,20 @@ Native ops: mxfp8, convrot_w4a4, float8_e5m2, nvfp4, float8_e4m3fn, int8_tensorw
   （一次 19.5 GB 的 scp 在 1.1 GB 处断过连接）。
 - **磁盘账**：34 GB int8 DiT + 19.5 GB FP8 + 14.6 GB TE 塞不进快满的内置盘；删掉没用的基础镜像
   （`nvcr.io/nvidia/pytorch`、旧的 cu128 镜像）腾出约 24 GB。
+
+### 5.6 两步流（卸载 TE）与像素帧预算（2026-10-24 更新）
+- 统一内存里把文本编码器"offload 到 CPU"**等于没省**——~15 GB 的 TE 还在同一个池子。生产因此走
+  **两步流**：第一步 = TE 编码 conditioning，`SaveConditioning`（自定义包 `comfyui-tefree`）写进
+  `/tmp`；ComfyUI `/free`（`free_memory:true` + 执行器重置）实测真释放 ~**15.4 GB**；第二步 = 无 CLIP
+  节点，纯采样 + 解码。
+- **图生视频（i2v）2026-10-22 起也走两步流**（`i2v_two_pass: true` 默认开：首/尾帧 + 提示词编码 →
+  卸 TE → 采样），旧的 **i2v 30M 像素帧上限已于 2026-10-21 移除**。
+- 预算速查（像素帧 = 宽×高×帧数；帧数 ≤362 ≈ 15s@24fps，取 17k+5 网格；模型训练区间 124–362）：
+  - **t2v（FP8 + Veda，两步流）：预算 2026-10-24 由 130M 提到 350M**——此前用户直提 ComfyUI 实测
+    **720P(1280×720)×362 ≈ 334M** 干净跑通；调度器实测 **800×448×362 = 129.7M ✓**（峰值 ~49G）。
+  - **i2v（两步流）：实测 1024×768×243 = 191.1M ✓**；已无静态预算，运行期内存守护
+    （`cancelled_low_memory`）兜底。
+  - **ref2va 仍是单程**（TE 常驻）：**30M** 预算；且是独立权重（`minimax_h3_ref2va_pruned_fp8_scaled`）。
 
 ---
 
@@ -217,9 +242,10 @@ exec python3 main.py --listen 0.0.0.0 --port 8189 --enable-cors-header \
 默认配方：FP8 DiT + `turbo_8step_v1.0`，`steps=8`，`cfg=1.0`，
 `MiniMaxH3SigmaShift(shift_video=12.0, shift_audio=3.0)`，euler/normal。
 
-> **可选 ~1.8× 块稀疏注意力**：加 `--use-sage-attention`，并把 `app/sageattention.py`（shim）+ 自带的
-> 预编译内核 `app/spas_sage_attn/`（异架构才需自编译）放进 ComfyUI 目录（`/workspace/comfyui`）。本模板
-> **默认关**；我们的生产部署是 **开**着的（`topk=0.3`）。详见 §5.3 与 INSTALL §8。
+> **注意力（2026-10-22 起的生产配置）**：~1.8× 的固定 topk **SpargeAttn** 路线（`--use-sage-attention`
+> + `app/sageattention.py` shim + 本包自带的预编译内核 `app/spas_sage_attn/`）**保留但已关停**
+> （开关文件 `sparge_topk` = `0`）——固定 topk 在运动多的片段上会画横向条纹。生产现在跑的是 **Veda**
+> 学习式稀疏注意力（`VedaSparseAttention` 节点 + `models/veda/` 预测子）。详见 §5.3，预算见 §5.6。
 
 ---
 
@@ -236,6 +262,8 @@ exec python3 main.py --listen 0.0.0.0 --port 8189 --enable-cors-header \
 | SpargeAttn topk=0.3 — 隔离注意力（hd128，16k/32k token） | ~2.42–2.62×（对 flash SDPA） |
 | SpargeAttn topk=0.3 — 端到端（768×432×5s，同 seed） | 271.8s → 151.3s（**~1.80×**） |
 | SpargeAttn topk=0.5 — 端到端（同上） | 271.8s → 166.4s（1.63×） |
+| 生产注意力（2026-10-22 起） | **Veda** 学习式稀疏 tile（`VedaSparseAttention`，t2va 8nfe 预测子）；SpargeAttn 已关（`sparge_topk`=0）——固定 topk 会画横向条纹 |
+| 两步流 + Veda 实测档位 | t2v 800×448×362 = **129.7M ✓** · i2v 1024×768×243 = **191.1M ✓** · 720P×362 ≈ **334M ✓**（直提 ComfyUI）——调度器 t2v 预算现为 **350M**，i2v 无预算 |
 | 峰值显存，int8 cu130 | 55.6 GB（aimdo 封顶） |
 | 峰值显存，FP8 cu130 | 48.9 GB |
 | 不 OOM 的最长片段 | cu130 可到 15 秒（362 帧）；cu128 只能 5 秒 |

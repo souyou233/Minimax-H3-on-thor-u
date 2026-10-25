@@ -153,8 +153,9 @@ ffmpeg -i <file>.mp4 2>&1 | grep -E 'Stream|Duration'
 By default attention runs on flash SDPA (already dense-optimal here). A **block-sparse** kernel
 (SpargeAttn: int8-QK + FP8-PV, the Sage2++ path) adds **~1.8× end-to-end** on top with no visible
 quality loss at `topk=0.3` (same-seed 768×432×5s: 271.8 s → 151.3 s). It is **opt-in** because the
-kernel must be compiled for this device; our production deployment ships it enabled. Skip this whole
-section to stay on flash — nothing else changes.
+kernel must be compiled for this device. This was our production accelerator until 2026-10-22;
+production now runs **Veda** (§8.1) and this path stays available as a fallback (our toggle file is
+set to `0` = off). Skip this whole section to stay on flash — nothing else changes.
 
 **A prebuilt kernel is included:** `app/spas_sage_attn/` holds a ready aarch64 (sm_101) build. Copy
 the package + the shim into the ComfyUI dir — no build needed:
@@ -188,13 +189,37 @@ break a render.
 **Live top-k toggle (no restart)** — the shim reads `/workspace/sparge_topk` on every call:
 
 ```bash
-echo 0.3 > /workspace/sparge_topk    # enable at topk=0.3 (recommended, ~1.8×)
+echo 0.3 > /workspace/sparge_topk    # enable at topk=0.3 (~1.8×; watch for streaks on fast motion)
 echo 0.5 > /workspace/sparge_topk    # more conservative (~1.6×)
-echo 0   > /workspace/sparge_topk    # disable -> flash SDPA
+echo 0   > /workspace/sparge_topk    # disable -> flash SDPA   (current production value)
 ```
 
 A missing file defaults to `0.3`; `0`/`off`/empty → flash. Because it is read per call you can flip
 it between generations without restarting.
+
+### 8.1 Production since 2026-10-22: Veda (learned sparse attention)
+
+Fixed top-k occasionally drew **horizontal streaks** on motion-heavy clips. Veda keeps the speed but
+removes the artifact: a **trained predictor** picks which 128-token key-tiles each query tile must
+compute. Three steps:
+
+```bash
+# 1) custom node package → comfyui/custom_nodes/
+git clone <Veda-on-ComfyUI repo per node docs> comfyui/custom_nodes/Veda-on-ComfyUI
+# 2) predictor weight → comfyui/models/veda/
+#    minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors   (small fp8 scorer)
+# 3) activate via dispatcher profiles.json:
+#    "veda_predictor": "minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors"
+```
+
+The dispatcher then wires `UNETLoader → LoraLoaderModelOnly → VedaSparseAttention →
+MiniMaxH3SigmaShift → KSampler` (the node must sit last on the MODEL wire before the sampler).
+Tuning keys (all optional): `veda_sparsity` / `veda_ref_sparsity` (default `"32"` tiles — whole
+numbers don't scale with resolution, which the two-pass first pass needs; `"90%"` percent style
+also works), `veda_dense_layers` / `veda_dense_steps` (keep full attention on chosen blocks/steps),
+`veda_verbose`. **Verify activation** in the run log: `Attention calls: N sparse` (N > 0). Caveat:
+the shipped predictor is a *t2va* scorer; on fl2va/ref2va backbones it runs out-of-domain — check
+that log line when you change workload.
 
 **Notes / limits:**
 - The sparse path needs `smooth_k=True` (SpargeAttn uses `km` unconditionally); the shim forces it.

@@ -24,7 +24,7 @@ speed/memory across model configs, and the full list of gotchas hit along the wa
 | SoC | NVIDIA **Thor** (Blackwell datacenter/auto line), aarch64 |
 | Compute capability | **sm_101** (Thor) — constant across CUDA versions; the CUDA toolkit version, not the arch, is the lever |
 | Memory | **60 GB unified** (CPU+GPU shared); `comfy-aimdo` manages it |
-| Stack | ComfyUI 0.34 · `comfy_kitchen` 0.2.31 · `comfy-aimdo` · torch 2.13.0+cu130 |
+| Stack | ComfyUI **0.42.1** (upgraded from 0.34 in 2026-10; graph unchanged) · `comfy_kitchen` 0.2.31 · `comfy-aimdo` · torch 2.13.0+cu130 |
 | Model | MiniMax H3 (`FLOW_AV`): AV latent = `NestedTensor(video[B,24,T,H/16,W/16], audio[B,32,2,T40])` |
 
 All clips below are **768×432, 124 frames (5 s @ 24 fps), CFG 1.0, `shift_video=12`, euler/normal**,
@@ -183,6 +183,21 @@ Reading the table:
 - **Caveat.** Validated on a calm-camera clip (no visible quality loss, deterministic output); push
   harder (higher sparsity, fast motion, fine detail) and spot-check. Sparse attention also nudges the
   diffusion trajectory, so output is intentionally *not* pixel-identical to the flash baseline.
+- **Update 2026-10-22 — production moved to Veda (learned sparse attention).** Fixed top-k sparsity
+  (0.3) turned out to draw **horizontal streaks** on motion-heavy clips. The lever is now the
+  **`VedaSparseAttention`** custom node (package `Veda-on-ComfyUI`), which computes only the
+  attention tiles a *trained predictor* marks important. Setup: predictor
+  `minimax_h3_t2va_veda_8nfe_600step_preview_fp8.safetensors` lives in `comfyui/models/veda/`; the
+  node is wired **after the LoRA loader, before `MiniMaxH3SigmaShift`**; tuning lives in dispatcher
+  `profiles.json` keys — `veda_predictor` (required to activate), optional `veda_sparsity` /
+  `veda_ref_sparsity` (default `"32"` key-tiles; a whole number does not scale with resolution,
+  which is what two-pass first passes need), `veda_dense_layers` / `veda_dense_steps` (default all
+  sparse), `veda_verbose`. **Verify from the run log:** `Attention calls: N sparse` with N > 0.
+  Caveat: the shipped predictor is a *t2va* scorer — on the fl2va/ref2va backbones it is
+  out-of-domain, so check that log line on new workloads (the node also lists an r2va predictor;
+  it is not downloaded). The SpargeAttn path is **kept but switched off**: the live toggle file
+  `/zeekr_data/video_gen/sparge_topk` is set to `0` (exact-SDPA baseline), so `--use-sage-attention`
+  and the shim remain harmless as a fallback.
 
 ### 5.4 Audio (the AV branch)
 - **The old "audio = machine freeze" red line was a CUDA-12.8 problem.** On cu128 the AV sampling
@@ -205,6 +220,25 @@ Reading the table:
   and verify byte size / sha256 (a 19.5 GB scp dropped connection once at 1.1 GB).
 - **Disk math**: the 34 GB int8 DiT + 19.5 GB FP8 + 14.6 GB TE don't fit a nearly-full internal
   disk; deleting unused base images (`nvcr.io/nvidia/pytorch`, the old cu128 image) freed ~24 GB.
+
+### 5.6 Two-pass TE-free flow & pixel-frame budgets (updated 2026-10-24)
+- In unified memory, "offloading" the text encoder to CPU saves **nothing** — the ~15 GB TE still
+  sits in the same pool. Production therefore runs **two passes**: pass 1 = TE encodes conditioning,
+  `SaveConditioning` (custom package `comfyui-tefree`) writes it to `/tmp`; ComfyUI's `/free`
+  (`free_memory:true` + executor reset) then actually releases ~**15.4 GB**; pass 2 = sample +
+  decode with no CLIP node loaded.
+- **image→video joined the two-pass flow on 2026-10-22** (`i2v_two_pass: true`, the default —
+  encode first/last frame + prompt, free TE, then sample), and the old **30 M pixel-frame cap on
+  i2v was removed on 2026-10-21**.
+- Budgets (pixel-frames = w×h×frames; frames ≤ 362 ≈ 15 s @ 24 fps, on the 17k+5 grid; trained
+  range 124–362):
+  - **t2v (FP8 + Veda, two-pass): cap raised 130 M → 350 M on 2026-10-24**, after a direct
+    ComfyUI run proved **720P (1280×720)×362 ≈ 334 M** clean; dispatcher-measured
+    **800×448×362 = 129.7 M ✓** (peak ~49 GB).
+  - **i2v (two-pass): measured 1024×768×243 = 191.1 M ✓**; no static cap — the runtime memory
+    guard (`cancelled_low_memory`) is the backstop.
+  - **ref2va stays single-pass** (TE resident): **30 M** budget; its DiT is a separate weight
+    (`minimax_h3_ref2va_pruned_fp8_scaled`).
 
 ---
 
@@ -236,10 +270,12 @@ exec python3 main.py --listen 0.0.0.0 --port 8189 --enable-cors-header \
 Default recipe: FP8 DiT + `turbo_8step_v1.0`, `steps=8`, `cfg=1.0`,
 `MiniMaxH3SigmaShift(shift_video=12.0, shift_audio=3.0)`, euler/normal.
 
-> **Optional ~1.8× block-sparse attention**: add `--use-sage-attention` and drop `app/sageattention.py`
-> (the shim) + the prebuilt `app/spas_sage_attn/` (included in this package; rebuild only for a
-> different arch) into the ComfyUI dir (`/workspace/comfyui`). It is **off by default in this
-> template**; our production deployment runs it **on** at `topk=0.3`. Details: §5.3 and INSTALL §8.
+> **Attention (production since 2026-10-22)**: the ~1.8× fixed-topk **SpargeAttn** path —
+> `--use-sage-attention` + `app/sageattention.py` (the shim) + the prebuilt `app/spas_sage_attn/`
+> included in this package — is **retained but switched off** (toggle file `sparge_topk` = `0`)
+> because fixed top-k drew horizontal streaks on motion-heavy clips. Production now runs **Veda**
+> learned sparse attention (`VedaSparseAttention` node + `models/veda/` predictor). Details: §5.3,
+> budgets §5.6.
 
 ---
 
@@ -256,6 +292,8 @@ Default recipe: FP8 DiT + `turbo_8step_v1.0`, `steps=8`, `cfg=1.0`,
 | SpargeAttn topk=0.3 — isolated attn (hd128, 16k/32k tok) | ~2.42–2.62× vs flash SDPA |
 | SpargeAttn topk=0.3 — end-to-end (768×432×5s, same seed) | 271.8 s → 151.3 s (**~1.80×**) |
 | SpargeAttn topk=0.5 — end-to-end (same) | 271.8 s → 166.4 s (1.63×) |
+| Production attention since 2026-10-22 | **Veda** learned sparse tiles (`VedaSparseAttention`, t2va 8nfe predictor); SpargeAttn off (`sparge_topk`=0) — fixed topk drew **horizontal streaks** on motion |
+| Measured ceilings, two-pass + Veda | t2v 800×448×362 = **129.7 M ✓** · i2v 1024×768×243 = **191.1 M ✓** · 720P×362 ≈ **334 M ✓** (direct ComfyUI run) — dispatcher t2v cap now **350 M**, i2v uncapped |
 | Peak mem, int8 cu130 | 55.6 GB (aimdo cap) |
 | Peak mem, FP8 cu130 | 48.9 GB |
 | Max clip without OOM | 15 s (362 frames) on cu130; 5 s on cu128 |
